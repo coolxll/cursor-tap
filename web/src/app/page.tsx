@@ -137,7 +137,7 @@ export default function Home() {
   const [selectedCallID, setSelectedCallID] = useState<string | null>(null);
   const [selectedRecordKey, setSelectedRecordKey] = useState<string | null>(null);
   const [framesLoading, setFramesLoading] = useState(false);
-  const [isConnected, setIsConnected] = useState(false);
+  const [, setIsConnected] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [liveTail, setLiveTail] = useState(true);
   const [timelineCursor, setTimelineCursor] = useState<number | null>(null);
@@ -651,9 +651,7 @@ export default function Home() {
   return (
     <main className="cursor-tap-workbench flex h-dvh min-w-[960px] flex-col overflow-hidden bg-[var(--ct-bg-base)] text-[var(--ct-text)] dark:bg-[var(--ct-bg-base)] dark:text-[var(--ct-text)]">
       <TitleBar
-        connected={isConnected}
         status={status}
-        stats={stats}
         isPaused={isPaused}
         liveTail={liveTail}
         isRecordingCapture={isRecordingCapture}
@@ -807,9 +805,7 @@ export default function Home() {
 }
 
 function TitleBar({
-  connected,
   status,
-  stats,
   isPaused,
   liveTail,
   isRecordingCapture,
@@ -826,11 +822,9 @@ function TitleBar({
   onToggleRecordCapture,
   onToggleTail,
   onClear,
-		onToggleTheme,
+	onToggleTheme,
 }: {
-  connected: boolean;
   status: RuntimeStatus | null;
-  stats: InspectorStats;
   isPaused: boolean;
   liveTail: boolean;
   isRecordingCapture: boolean;
@@ -849,30 +843,24 @@ function TitleBar({
   onClear: () => void;
   onToggleTheme: () => void;
 }) {
+  const proxyPort = status?.http_port || 8080;
   return (
     <header className="ct-window-drag flex h-[42px] shrink-0 items-center overflow-hidden border-b border-[var(--ct-border)] bg-[var(--ct-bg-window)] pl-[78px] pr-[14px]">
-      <div className="ct-window-no-drag flex min-w-0 shrink-0 items-center gap-2">
-        <span className={cn('ct-status-pill', connected ? 'ct-status-pill--connected' : 'ct-status-pill--offline')}>
-          {connected ? 'Connected' : 'Offline'}
-        </span>
-        <span className="ct-port-badge">:{status?.http_port || 8080}</span>
-        <ToolbarButton onClick={onShowPalette} title="Proxy configuration help" compact>
-          <HelpCircle className="h-3.5 w-3.5" />
-        </ToolbarButton>
-        <span className="ct-header-stat mono">{stats.calls.toLocaleString()} calls</span>
-        {isPaused && <span className="ct-proto-chip ct-proto-chip--warning">paused</span>}
-      </div>
-
       <div className="ct-window-no-drag ml-auto flex min-w-0 shrink items-center justify-end gap-1 overflow-hidden">
         <button type="button" className="ct-search-trigger mr-1 hidden min-[1180px]:flex" onClick={onShowPalette}>
           <Search className="h-[13px] w-[13px]" />
           <span className="truncate">Search calls, services, methods...</span>
           <kbd>⌘K</kbd>
         </button>
-        <ToolbarButton onClick={onStartProxy} active={busy === 'proxy'} title={`Proxy :${status?.http_port || 8080}`}>
+        <ToolbarButton onClick={onStartProxy} active={busy === 'proxy'} title={`Proxy :${proxyPort}`}>
           <Activity className="h-3.5 w-3.5" />
           <span className="hidden min-[1280px]:inline">Proxy</span>
         </ToolbarButton>
+        <span className="ct-port-badge">:{proxyPort}</span>
+        <ToolbarButton onClick={onShowPalette} title="Proxy configuration help" compact>
+          <HelpCircle className="h-3.5 w-3.5" />
+        </ToolbarButton>
+        {isPaused && <span className="ct-proto-chip ct-proto-chip--warning">paused</span>}
         <ToolbarButton onClick={onLoadProtocol} active={busy === 'protocol'} title="Load Protocol">
           <FileCode2 className="h-3.5 w-3.5" />
           <span className="hidden min-[1280px]:inline">Proto</span>

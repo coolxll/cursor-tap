@@ -18,6 +18,8 @@ Wails 提供原生桌面壳，Go 负责本地代理、MITM、协议解析和 SQL
 
 ![Cursor-Tap stream detail](assets/readme/stream-detail.png)
 
+![Cursor-Tap 捕获 Cursor LLM 响应](assets/readme/cursor-llm-capture.png)
+
 ## 这个 fork 做了什么
 
 - **App 化**：用 Wails 封装为 macOS 桌面 App，不再把 WebUI 和 CLI 当作主要入口。

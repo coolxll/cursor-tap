@@ -18,6 +18,8 @@ Wails provides the native macOS shell, Go powers the local proxy, MITM, protocol
 
 ![Cursor-Tap stream detail](assets/readme/stream-detail.png)
 
+![Cursor-Tap capturing Cursor LLM response](assets/readme/cursor-llm-capture.png)
+
 ## What This Fork Adds
 
 - **App-first workflow**: packaged as a macOS desktop app with Wails instead of treating the WebUI and CLI as the main entry points.
