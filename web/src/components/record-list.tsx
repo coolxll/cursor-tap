@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo, useRef, useEffect, memo, useCallback } from 'react';
+import { useState, useMemo, useRef, useEffect, memo } from 'react';
 import { Record, getRecordColor, formatTimestamp, getRecordTitle } from '@/lib/types';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Badge } from '@/components/ui/badge';

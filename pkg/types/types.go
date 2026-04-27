@@ -93,6 +93,8 @@ type Config struct {
 	EnableHTTPParsing bool     `json:"enable_http_parsing"` // Enable HTTP stream parsing
 	HTTPLogLevel      LogLevel `json:"http_log_level"`      // HTTP logging verbosity
 	HTTPRecordFile    string   `json:"http_record_file"`    // JSONL file for HTTP traffic recording
+	SQLitePath        string   `json:"sqlite_path"`         // SQLite database for persistent records
+	ProtocolPath      string   `json:"protocol_path"`       // Runtime .proto/.js protocol source
 }
 
 // DefaultConfig returns the default configuration.
@@ -104,5 +106,6 @@ func DefaultConfig() *Config {
 		CertDir:       "~/.cursor-tap",
 		DataDir:       "~/.cursor-tap/data",
 		UpstreamProxy: "", // No upstream proxy by default
+		SQLitePath:    "~/.cursor-tap/data/cursor-tap.sqlite",
 	}
 }

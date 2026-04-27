@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useMemo, useRef } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import { Record, SessionInfo } from '@/lib/types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:9090';
@@ -17,18 +17,11 @@ export function useRecords() {
   // Filter state - multi-select
   const [selectedServices, setSelectedServices] = useState<Set<string>>(new Set());
   const [selectedMethods, setSelectedMethods] = useState<Set<string>>(new Set());
-  
-  // Cache for quick record lookup
-  const recordsMap = useRef(new Map<string, Record>());
-
   // Add a new record from WebSocket (with deduplication)
   const addRecord = useCallback((record: Record) => {
     if (isPaused) return;
 
     const key = `${record.session}-${record.index}`;
-    
-    // Update cache
-    recordsMap.current.set(key, record);
 
     setRecords((prev) => {
       // Deduplicate by session + index
@@ -37,25 +30,15 @@ export function useRecords() {
         return prev;
       }
 
-      const newRecords = [...prev, record];
-      // Keep only last 10000 records in browser
-      if (newRecords.length > 10000) {
-        // Clean up old entries from cache
-        const removed = newRecords.slice(0, newRecords.length - 10000);
-        for (const r of removed) {
-          recordsMap.current.delete(`${r.session}-${r.index}`);
-        }
-        return newRecords.slice(-10000);
-      }
-      return newRecords;
+      return [...prev, record].slice(-10000);
     });
   }, [isPaused]);
 
   // Compute selected record from key (stable reference)
   const selectedRecord = useMemo(() => {
     if (!selectedRecordKey) return null;
-    return recordsMap.current.get(selectedRecordKey) || null;
-  }, [selectedRecordKey]);
+    return records.find((record) => `${record.session}-${record.index}` === selectedRecordKey) || null;
+  }, [records, selectedRecordKey]);
 
   // Wrapper to set record by object (finds key)
   const setSelectedRecord = useCallback((record: Record | null) => {
@@ -63,8 +46,6 @@ export function useRecords() {
       setSelectedRecordKey(null);
     } else {
       const key = `${record.session}-${record.index}`;
-      // Ensure it's in cache
-      recordsMap.current.set(key, record);
       setSelectedRecordKey(key);
     }
   }, []);
@@ -212,11 +193,6 @@ export function useRecords() {
       const res = await fetch(`${API_BASE}/api/records?limit=100`);
       const data = await res.json();
       if (Array.isArray(data) && data.length > 0) {
-        // Update cache
-        for (const r of data as Record[]) {
-          recordsMap.current.set(`${r.session}-${r.index}`, r);
-        }
-        
         setRecords((prev) => {
           // Merge and deduplicate
           const existingKeys = new Set(prev.map((r) => `${r.session}-${r.index}`));
@@ -253,7 +229,6 @@ export function useRecords() {
     setRecords([]);
     setSelectedSession(null);
     setSelectedRecordKey(null);
-    recordsMap.current.clear();
   }, []);
 
   return {

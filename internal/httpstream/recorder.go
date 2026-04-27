@@ -62,12 +62,19 @@ type Record struct {
 // RecordCallback is called when a record is written.
 type RecordCallback func(Record)
 
+// RecordSink persists records outside the recorder's in-memory cache.
+type RecordSink interface {
+	SaveRecord(Record) error
+	RecentRecords(limit int) ([]Record, error)
+}
+
 // Recorder writes HTTP traffic to JSONL file with session tracking.
 type Recorder struct {
 	mu       sync.Mutex
 	file     *os.File
 	encoder  *json.Encoder
 	logLevel LogLevel
+	sink     RecordSink
 
 	// Stats
 	records    atomic.Int64
@@ -100,16 +107,27 @@ func WithCacheSize(size int) RecorderOption {
 	return func(r *Recorder) { r.maxCacheSize = size }
 }
 
+// WithRecordSink sets a persistent record sink such as SQLite.
+func WithRecordSink(sink RecordSink) RecorderOption {
+	return func(r *Recorder) { r.sink = sink }
+}
+
 // NewRecorder creates a new JSONL recorder.
 func NewRecorder(path string, opts ...RecorderOption) (*Recorder, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|os.O_SYNC, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("open recorder file: %w", err)
+	var file *os.File
+	var encoder *json.Encoder
+	if path != "" {
+		var err error
+		file, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|os.O_SYNC, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("open recorder file: %w", err)
+		}
+		encoder = json.NewEncoder(file)
 	}
 
 	r := &Recorder{
 		file:         file,
-		encoder:      json.NewEncoder(file),
+		encoder:      encoder,
 		logLevel:     LogLevelBasic,
 		recordCache:  make([]Record, 0, 1000),
 		maxCacheSize: 1000, // Keep last 1000 records for initial load
@@ -126,17 +144,29 @@ func NewRecorder(path string, opts ...RecorderOption) (*Recorder, error) {
 func (r *Recorder) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.file == nil {
+		return nil
+	}
 	return r.file.Close()
 }
 
 // write writes a record to the file (thread-safe, sync write).
 func (r *Recorder) write(rec Record) error {
-	r.mu.Lock()
-	if err := r.encoder.Encode(rec); err != nil {
+	if r.encoder != nil {
+		r.mu.Lock()
+		if err := r.encoder.Encode(rec); err != nil {
+			r.mu.Unlock()
+			return err
+		}
 		r.mu.Unlock()
-		return err
 	}
-	r.mu.Unlock()
+
+	if r.sink != nil {
+		if err := r.sink.SaveRecord(rec); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to persist record: %v\n", err)
+			return err
+		}
+	}
 
 	r.records.Add(1)
 
@@ -168,6 +198,16 @@ func (r *Recorder) addToCache(rec Record) {
 // RecordCount returns the number of records written.
 func (r *Recorder) RecordCount() int64 {
 	return r.records.Load()
+}
+
+// ClearCache clears the recorder's in-memory recent-record cache.
+func (r *Recorder) ClearCache() {
+	if r == nil {
+		return
+	}
+	r.cacheMu.Lock()
+	r.recordCache = r.recordCache[:0]
+	r.cacheMu.Unlock()
 }
 
 // Session represents a tracked HTTP session.
@@ -220,7 +260,7 @@ func (s *Session) LogRequest(msg *HTTPMessage) {
 		Type:        "request",
 		Method:      req.Method,
 		URL:         req.URL.RequestURI(),
-		Host:        s.Host,
+		Host:        firstNonEmpty(req.Host, s.Host),
 		Headers:     cloneHeaders(req.Header),
 		ContentType: req.Header.Get("Content-Type"),
 	}
@@ -325,15 +365,18 @@ func (s *Session) LogGRPC(msg *GRPCMessage) {
 
 	if msg.JSON != "" {
 		rec.GRPCData = msg.JSON
-	} else if msg.Frame != nil {
+	}
+	if msg.Frame != nil {
 		rec.Size = len(msg.Frame.Data)
+		if len(msg.Frame.Data) > 0 {
+			rec.GRPCRawData = base64.StdEncoding.EncodeToString(msg.Frame.Data)
+		}
 	}
 
 	if msg.Error != "" {
 		rec.Error = msg.Error
-		// Include raw data on error for debugging
-		if msg.Frame != nil && len(msg.Frame.Data) > 0 {
-			rec.GRPCRawData = base64.StdEncoding.EncodeToString(msg.Frame.Data)
+		if rec.GRPCRawData == "" && msg.Frame != nil && len(msg.Frame.RawData) > 0 {
+			rec.GRPCRawData = base64.StdEncoding.EncodeToString(msg.Frame.RawData)
 		}
 	}
 
@@ -401,6 +444,15 @@ func cloneHeaders(h http.Header) map[string][]string {
 	return clone
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 // truncateString truncates string to max length.
 func truncateString(s string, max int) string {
 	if len(s) <= max {
@@ -428,11 +480,26 @@ func (r *Recorder) WriteTo(w io.Writer) (int64, error) {
 	defer r.mu.Unlock()
 
 	// Flush and sync
+	if r.file == nil {
+		return 0, nil
+	}
 	return 0, r.file.Sync()
 }
 
 // GetRecentRecords returns the most recent records (for initial frontend load).
 func (r *Recorder) GetRecentRecords(limit int) []interface{} {
+	if r.sink != nil {
+		records, err := r.sink.RecentRecords(limit)
+		if err == nil {
+			results := make([]interface{}, 0, len(records))
+			for _, rec := range records {
+				results = append(results, rec)
+			}
+			return results
+		}
+		fmt.Fprintf(os.Stderr, "Warning: failed to load records from sink: %v\n", err)
+	}
+
 	r.cacheMu.RLock()
 	defer r.cacheMu.RUnlock()
 

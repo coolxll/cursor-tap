@@ -3,14 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 
-	"github.com/burpheart/cursor-tap/internal/ca"
 	"github.com/burpheart/cursor-tap/internal/proxy"
 	"github.com/burpheart/cursor-tap/pkg/types"
 	"github.com/spf13/cobra"
@@ -23,6 +21,8 @@ var (
 	certDir       string
 	dataDir       string
 	upstreamProxy string
+	sqlitePath    string
+	protocolPath  string
 
 	// HTTP parsing flags
 	enableHTTPParsing bool
@@ -49,49 +49,11 @@ func main() {
 	startCmd.Flags().StringVar(&certDir, "cert-dir", "~/.cursor-tap", "Certificate storage directory")
 	startCmd.Flags().StringVar(&dataDir, "data-dir", "", "Data storage directory (default: cert-dir/data)")
 	startCmd.Flags().StringVar(&upstreamProxy, "upstream", "", "Upstream proxy URL (e.g., socks5://127.0.0.1:7890)")
+	startCmd.Flags().StringVar(&sqlitePath, "sqlite", "", "SQLite database path (default: <data-dir>/cursor-tap.sqlite)")
+	startCmd.Flags().StringVar(&protocolPath, "protocol", "", "Runtime .proto/.js protocol source")
 	startCmd.Flags().BoolVar(&enableHTTPParsing, "http-parse", false, "Enable HTTP stream parsing and logging")
 	startCmd.Flags().IntVar(&httpLogLevel, "http-log", 1, "HTTP log level (0=none, 1=basic, 2=headers, 3=body, 4=debug)")
 	startCmd.Flags().StringVar(&httpRecordFile, "http-record", "", "JSONL file for HTTP traffic recording (enables --http-parse)")
-
-	// ca command
-	caCmd := &cobra.Command{
-		Use:   "ca",
-		Short: "CA certificate management",
-	}
-
-	caInfoCmd := &cobra.Command{
-		Use:   "info",
-		Short: "Show CA certificate information",
-		RunE:  runCAInfo,
-	}
-	caInfoCmd.Flags().StringVar(&certDir, "cert-dir", "~/.cursor-tap", "Certificate storage directory")
-
-	caExportCmd := &cobra.Command{
-		Use:   "export",
-		Short: "Export CA certificate",
-		RunE:  runCAExport,
-	}
-	caExportCmd.Flags().StringVar(&certDir, "cert-dir", "~/.cursor-tap", "Certificate storage directory")
-	var outputPath string
-	caExportCmd.Flags().StringVarP(&outputPath, "output", "o", "./ca.crt", "Output file path")
-
-	caRegenerateCmd := &cobra.Command{
-		Use:   "regenerate",
-		Short: "Regenerate CA certificate",
-		RunE:  runCARegenerate,
-	}
-	caRegenerateCmd.Flags().StringVar(&certDir, "cert-dir", "~/.cursor-tap", "Certificate storage directory")
-	var force bool
-	caRegenerateCmd.Flags().BoolVar(&force, "force", false, "Force regeneration without confirmation")
-
-	caCleanCertsCmd := &cobra.Command{
-		Use:   "clean-certs",
-		Short: "Clean cached server certificates",
-		RunE:  runCACleanCerts,
-	}
-	caCleanCertsCmd.Flags().StringVar(&certDir, "cert-dir", "~/.cursor-tap", "Certificate storage directory")
-
-	caCmd.AddCommand(caInfoCmd, caExportCmd, caRegenerateCmd, caCleanCertsCmd)
 
 	// sessions command
 	sessionsCmd := &cobra.Command{
@@ -109,7 +71,7 @@ func main() {
 	}
 	statsCmd.Flags().StringVar(&certDir, "cert-dir", "~/.cursor-tap", "Certificate storage directory")
 
-	rootCmd.AddCommand(startCmd, caCmd, sessionsCmd, statsCmd)
+	rootCmd.AddCommand(startCmd, sessionsCmd, statsCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -130,6 +92,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 		enableHTTPParsing = true
 		httpRecordFile = expandPath(httpRecordFile)
 	}
+	if sqlitePath == "" {
+		sqlitePath = filepath.Join(dataDir, "cursor-tap.sqlite")
+	} else {
+		sqlitePath = expandPath(sqlitePath)
+	}
+	if protocolPath != "" {
+		protocolPath = expandPath(protocolPath)
+	}
+	if sqlitePath != "" {
+		enableHTTPParsing = true
+	}
 
 	// Create config
 	config := types.Config{
@@ -142,6 +115,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 		EnableHTTPParsing: enableHTTPParsing,
 		HTTPLogLevel:      types.LogLevel(httpLogLevel),
 		HTTPRecordFile:    httpRecordFile,
+		SQLitePath:        sqlitePath,
+		ProtocolPath:      protocolPath,
 	}
 
 	// Print startup info
@@ -161,6 +136,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 	if config.HTTPRecordFile != "" {
 		fmt.Printf("║  HTTP Record:   %-25s║\n", truncateString(config.HTTPRecordFile, 25))
+	}
+	if config.SQLitePath != "" {
+		fmt.Printf("║  SQLite:        %-25s║\n", truncateString(config.SQLitePath, 25))
+	}
+	if config.ProtocolPath != "" {
+		fmt.Printf("║  Protocol:      %-25s║\n", truncateString(config.ProtocolPath, 25))
 	}
 	fmt.Println("║                                          ║")
 	fmt.Println("║  KeyLog: <data-dir>/sslkeys.log          ║")
@@ -186,105 +167,6 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}()
 
 	return server.Start()
-}
-
-func runCAInfo(cmd *cobra.Command, args []string) error {
-	certDir = expandPath(certDir)
-
-	caInstance, err := ca.New(ca.Options{
-		CertDir: certDir,
-	})
-	if err != nil {
-		return fmt.Errorf("load CA: %w", err)
-	}
-
-	fmt.Printf("CA Certificate: %s\n", caInstance.CertPath())
-	fmt.Printf("CA Private Key: %s\n", caInstance.KeyPath())
-	fmt.Printf("Cached Certs:   %s (%d certificates)\n", caInstance.CertsDir(), caInstance.CertCount())
-
-	return nil
-}
-
-func runCAExport(cmd *cobra.Command, args []string) error {
-	certDir = expandPath(certDir)
-	outputPath, _ := cmd.Flags().GetString("output")
-
-	caInstance, err := ca.New(ca.Options{
-		CertDir: certDir,
-	})
-	if err != nil {
-		return fmt.Errorf("load CA: %w", err)
-	}
-
-	// Copy CA certificate to output path
-	srcPath := caInstance.CertPath()
-	src, err := os.Open(srcPath)
-	if err != nil {
-		return fmt.Errorf("open CA cert: %w", err)
-	}
-	defer src.Close()
-
-	dst, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("create output file: %w", err)
-	}
-	defer dst.Close()
-
-	if _, err := io.Copy(dst, src); err != nil {
-		return fmt.Errorf("copy CA cert: %w", err)
-	}
-
-	fmt.Printf("CA certificate exported to: %s\n", outputPath)
-	return nil
-}
-
-func runCARegenerate(cmd *cobra.Command, args []string) error {
-	certDir = expandPath(certDir)
-	force, _ := cmd.Flags().GetBool("force")
-
-	if !force {
-		fmt.Print("This will regenerate the CA certificate and clear all cached certificates. Continue? [y/N] ")
-		var response string
-		fmt.Scanln(&response)
-		if response != "y" && response != "Y" {
-			fmt.Println("Aborted.")
-			return nil
-		}
-	}
-
-	caInstance, err := ca.New(ca.Options{
-		CertDir: certDir,
-	})
-	if err != nil {
-		return fmt.Errorf("load CA: %w", err)
-	}
-
-	if err := caInstance.Regenerate(); err != nil {
-		return fmt.Errorf("regenerate CA: %w", err)
-	}
-
-	fmt.Println("CA certificate regenerated successfully.")
-	fmt.Printf("New CA certificate: %s\n", caInstance.CertPath())
-	return nil
-}
-
-func runCACleanCerts(cmd *cobra.Command, args []string) error {
-	certDir = expandPath(certDir)
-
-	caInstance, err := ca.New(ca.Options{
-		CertDir: certDir,
-	})
-	if err != nil {
-		return fmt.Errorf("load CA: %w", err)
-	}
-
-	count := caInstance.CertCount()
-	if err := caInstance.CleanCerts(); err != nil {
-		return fmt.Errorf("clean certs: %w", err)
-	}
-
-	fmt.Printf("Cleaned %d cached certificates.\n", count)
-	return nil
 }
 
 func runSessions(cmd *cobra.Command, args []string) error {

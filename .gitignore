@@ -1,0 +1,42 @@
+# macOS / editors
+.DS_Store
+.idea/
+
+# Local environment
+.env*
+*.pem
+
+# Runtime captures, traces, and local app data
+artifacts/
+.cursor-tap/
+*.jsonl
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.har
+*.pcap
+
+# Go / Wails build output
+build/bin/
+build/release/
+dist/
+tmp/
+
+# Frontend dependencies and generated output
+web/node_modules/
+web/node_modules.to-delete.*/
+web/.npm-cache/
+web/.next/
+web/out/
+web/wailsjs/
+web/build/
+web/coverage/
+web/package.json.md5
+web/next-env.d.ts
+web/*.tsbuildinfo
+web/npm-debug.log*
+web/yarn-debug.log*
+web/yarn-error.log*
+web/.pnpm-debug.log*

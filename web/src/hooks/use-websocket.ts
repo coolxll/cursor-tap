@@ -12,16 +12,49 @@ export function useWebSocket(
   onReconnect?: () => void
 ) {
   const clientRef = useRef<WSClient | null>(null);
+  const onRecordRef = useRef(onRecord);
+  const onStatusRef = useRef(onStatus);
+  const onReconnectRef = useRef(onReconnect);
 
   useEffect(() => {
-    const client = new WSClient(WS_URL, onRecord, onStatus, onReconnect);
+    onRecordRef.current = onRecord;
+  }, [onRecord]);
+
+  useEffect(() => {
+    onStatusRef.current = onStatus;
+  }, [onStatus]);
+
+  useEffect(() => {
+    onReconnectRef.current = onReconnect;
+  }, [onReconnect]);
+
+  useEffect(() => {
+    const clientID = createClientID();
+    const client = new WSClient(
+      withClientID(WS_URL, clientID),
+      (record) => onRecordRef.current(record),
+      (connected) => onStatusRef.current(connected),
+      () => onReconnectRef.current?.()
+    );
     clientRef.current = client;
     client.connect();
 
     return () => {
       client.disconnect();
+      clientRef.current = null;
     };
-  }, [onRecord, onStatus, onReconnect]);
+  }, []);
+}
 
-  return clientRef.current;
+function createClientID() {
+  if (typeof window !== 'undefined' && window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function withClientID(rawURL: string, clientID: string) {
+  const url = new URL(rawURL);
+  url.searchParams.set('client_id', clientID);
+  return url.toString();
 }

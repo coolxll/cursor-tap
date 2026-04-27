@@ -1,6 +1,9 @@
 'use client';
 
-import { useState, useRef, useEffect, Children, ReactNode } from 'react';
+/* eslint-disable react-hooks/immutability */
+
+import { useState, useRef, useEffect, Children } from 'react';
+import type { KeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from 'react';
 import { cn } from '@/lib/utils';
 
 interface ResizablePanelsProps {
@@ -24,7 +27,7 @@ export function ResizablePanels({
 
   const childArray = Children.toArray(children);
 
-  const handleMouseDown = (index: number, e: React.MouseEvent) => {
+  const handleMouseDown = (index: number, e: ReactMouseEvent<HTMLDivElement>) => {
     e.preventDefault();
     draggingRef.current = index;
     startXRef.current = e.clientX;
@@ -33,8 +36,37 @@ export function ResizablePanels({
     document.body.style.userSelect = 'none';
   };
 
+  const nudgeSeparator = (index: number, deltaPercent: number) => {
+    if (!containerRef.current) return;
+    const containerWidth = containerRef.current.offsetWidth;
+    const next = [...sizes];
+    const leftMin = minSizes[index] ? (minSizes[index] / containerWidth) * 100 : 5;
+    const rightMin = minSizes[index + 1] ? (minSizes[index + 1] / containerWidth) * 100 : 5;
+    const left = next[index] + deltaPercent;
+    const right = next[index + 1] - deltaPercent;
+    if (left < leftMin || right < rightMin) return;
+    next[index] = left;
+    next[index + 1] = right;
+    setSizes(next);
+  };
+
+  const handleKeyDown = (index: number, event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      nudgeSeparator(index, -2);
+    }
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      nudgeSeparator(index, 2);
+    }
+    if (event.key === 'Home') {
+      event.preventDefault();
+      setSizes(defaultSizes);
+    }
+  };
+
   useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
+    const handleMouseMove = (e: globalThis.MouseEvent) => {
       if (draggingRef.current === null || !containerRef.current) return;
 
       const containerWidth = containerRef.current.offsetWidth;
@@ -103,8 +135,13 @@ export function ResizablePanels({
           {/* Separator (not after last panel) */}
           {index < childArray.length - 1 && (
             <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label={`Resize inspector column ${index + 1}`}
+              tabIndex={0}
               onMouseDown={(e) => handleMouseDown(index, e)}
-              className="w-1 h-full bg-border hover:bg-blue-500 active:bg-blue-600 cursor-col-resize flex-shrink-0 transition-colors"
+              onKeyDown={(event) => handleKeyDown(index, event)}
+              className="ct-panel-resizer h-full w-1 flex-shrink-0 cursor-col-resize bg-border transition-colors hover:bg-blue-500 active:bg-blue-600"
             />
           )}
         </div>

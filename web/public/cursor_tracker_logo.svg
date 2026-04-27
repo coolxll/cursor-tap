@@ -1,0 +1,107 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Cursor Tracker Logo</title>
+  <desc>Faceted geometric cursor tracker logo with grayscale prism, target ring, and blue tracking accents.</desc>
+
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="44%" r="72%">
+      <stop offset="0%" stop-color="#181818"/>
+      <stop offset="58%" stop-color="#0D0D0B"/>
+      <stop offset="100%" stop-color="#050505"/>
+    </radialGradient>
+
+    <linearGradient id="silverA" x1="250" y1="190" x2="790" y2="850" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F6F6F3"/>
+      <stop offset="35%" stop-color="#8B8B88"/>
+      <stop offset="100%" stop-color="#252624"/>
+    </linearGradient>
+
+    <linearGradient id="silverB" x1="760" y1="160" x2="340" y2="850" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="48%" stop-color="#858684"/>
+      <stop offset="100%" stop-color="#191A18"/>
+    </linearGradient>
+
+    <linearGradient id="darkFacet" x1="150" y1="250" x2="870" y2="850" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#666764"/>
+      <stop offset="50%" stop-color="#2F302E"/>
+      <stop offset="100%" stop-color="#111210"/>
+    </linearGradient>
+
+    <linearGradient id="blueGlow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#70C4FF"/>
+      <stop offset="50%" stop-color="#188BFF"/>
+      <stop offset="100%" stop-color="#0057FF"/>
+    </linearGradient>
+
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="28" stdDeviation="28" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+
+    <filter id="blueBlur" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <clipPath id="hexClip">
+      <polygon points="512,150 810,322 810,666 512,838 214,666 214,322"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- Outer faceted tracker prism -->
+  <g filter="url(#softShadow)" clip-path="url(#hexClip)">
+    <polygon points="512,150 810,322 646,386 512,314" fill="url(#silverB)"/>
+    <polygon points="512,150 512,314 378,386 214,322" fill="#5C5D5A"/>
+    <polygon points="214,322 378,386 314,512 214,666" fill="url(#darkFacet)"/>
+    <polygon points="810,322 646,386 710,512 810,666" fill="#555654"/>
+    <polygon points="214,666 314,512 512,710 512,838" fill="#2A2B29"/>
+    <polygon points="810,666 710,512 512,710 512,838" fill="url(#silverA)"/>
+    <polygon points="378,386 512,314 646,386 710,512 512,710 314,512" fill="#111210"/>
+  </g>
+
+  <!-- Prism outline highlights -->
+  <path d="M512 150L810 322V666L512 838L214 666V322L512 150Z" stroke="#9C9D9A" stroke-opacity="0.42" stroke-width="3"/>
+  <path d="M512 150V314M214 322L378 386M810 322L646 386M512 838V710" stroke="#F2F2EF" stroke-opacity="0.20" stroke-width="2"/>
+
+  <!-- Target/crosshair ring -->
+  <circle cx="512" cy="512" r="202" fill="#080908"/>
+  <path d="M512 322
+           A190 190 0 0 1 702 512"
+        stroke="#2C2D2B" stroke-width="34" stroke-linecap="butt"/>
+  <path d="M702 512
+           A190 190 0 0 1 512 702"
+        stroke="#333431" stroke-width="34" stroke-linecap="butt"/>
+  <path d="M512 702
+           A190 190 0 0 1 322 512"
+        stroke="#3A3B38" stroke-width="34" stroke-linecap="butt"/>
+  <path d="M322 512
+           A190 190 0 0 1 512 322"
+        stroke="#262725" stroke-width="34" stroke-linecap="butt"/>
+
+  <circle cx="512" cy="512" r="145" stroke="#5A5B57" stroke-opacity="0.55" stroke-width="22"
+          stroke-dasharray="96 54" transform="rotate(-18 512 512)"/>
+
+  <!-- Blue tracking ticks -->
+  <g filter="url(#blueBlur)">
+    <rect x="499" y="312" width="26" height="72" rx="3" fill="url(#blueGlow)"/>
+    <rect x="499" y="640" width="26" height="72" rx="3" fill="url(#blueGlow)"/>
+    <rect x="312" y="499" width="72" height="26" rx="3" fill="url(#blueGlow)"/>
+    <rect x="640" y="499" width="72" height="26" rx="3" fill="url(#blueGlow)"/>
+  </g>
+
+  <!-- Cursor pointer -->
+  <g filter="url(#softShadow)">
+    <polygon points="408,502 646,402 556,650 516,542" fill="#ECECEA"/>
+    <polygon points="516,542 556,650 590,468" fill="#AFAFAC"/>
+    <polygon points="408,502 516,542 646,402" fill="#FFFFFF"/>
+    <polygon points="516,542 556,650 493,566" fill="#0A5DFF"/>
+    <path d="M408 502L646 402L556 650L516 542L408 502Z" stroke="#D8D8D5" stroke-opacity="0.8" stroke-width="3" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Small central blue locator -->
+  <circle cx="512" cy="512" r="6" fill="#62B8FF" filter="url(#blueBlur)"/>
+</svg>

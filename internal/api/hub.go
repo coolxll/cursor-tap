@@ -3,19 +3,29 @@ package api
 
 import (
 	"encoding/json"
+	"net"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+const (
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 1024
+	maxHubClients  = 512
 )
 
 // Hub manages WebSocket connections and broadcasts records to all clients.
 type Hub struct {
 	mu      sync.RWMutex
 	clients map[*Client]bool
-	
+
 	// Channel for broadcasting records
 	broadcast chan []byte
-	
+
 	// Register/unregister channels
 	register   chan *Client
 	unregister chan *Client
@@ -23,9 +33,11 @@ type Hub struct {
 
 // Client represents a WebSocket client connection.
 type Client struct {
-	hub  *Hub
-	conn *websocket.Conn
-	send chan []byte
+	hub        *Hub
+	conn       *websocket.Conn
+	send       chan []byte
+	remoteHost string
+	clientID   string
 }
 
 // NewHub creates a new Hub instance.
@@ -44,27 +56,52 @@ func (h *Hub) Run() {
 		select {
 		case client := <-h.register:
 			h.mu.Lock()
+			h.removeClientsForClientIDLocked(client.clientID)
+			for len(h.clients) >= maxHubClients {
+				for existing := range h.clients {
+					h.removeClientLocked(existing)
+					break
+				}
+			}
 			h.clients[client] = true
 			h.mu.Unlock()
-			
+
 		case client := <-h.unregister:
 			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-			}
+			h.removeClientLocked(client)
 			h.mu.Unlock()
-			
+
 		case message := <-h.broadcast:
-			h.mu.RLock()
+			h.mu.Lock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
 				default:
-					// Client buffer full, skip
+					// Client buffer full; drop it so future broadcasts remain healthy.
+					h.removeClientLocked(client)
 				}
 			}
-			h.mu.RUnlock()
+			h.mu.Unlock()
+		}
+	}
+}
+
+func (h *Hub) removeClientLocked(client *Client) {
+	if _, ok := h.clients[client]; !ok {
+		return
+	}
+	delete(h.clients, client)
+	close(client.send)
+	_ = client.conn.Close()
+}
+
+func (h *Hub) removeClientsForClientIDLocked(clientID string) {
+	if clientID == "" {
+		return
+	}
+	for client := range h.clients {
+		if client.clientID == clientID {
+			h.removeClientLocked(client)
 		}
 	}
 }
@@ -75,7 +112,7 @@ func (h *Hub) Broadcast(record interface{}) {
 	if err != nil {
 		return
 	}
-	
+
 	select {
 	case h.broadcast <- data:
 	default:
@@ -87,7 +124,15 @@ func (h *Hub) Broadcast(record interface{}) {
 func (h *Hub) ClientCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return len(h.clients)
+	seen := make(map[string]bool, len(h.clients))
+	for client := range h.clients {
+		key := client.clientID
+		if key == "" {
+			key = "anon:" + client.remoteHost
+		}
+		seen[key] = true
+	}
+	return len(seen)
 }
 
 // Register adds a new client to the hub.
@@ -101,23 +146,44 @@ func (h *Hub) Unregister(client *Client) {
 }
 
 // NewClient creates a new WebSocket client.
-func NewClient(hub *Hub, conn *websocket.Conn) *Client {
+func NewClient(hub *Hub, conn *websocket.Conn, remoteAddr string, clientID string) *Client {
+	remoteHost, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		remoteHost = remoteAddr
+	}
 	return &Client{
-		hub:  hub,
-		conn: conn,
-		send: make(chan []byte, 256),
+		hub:        hub,
+		conn:       conn,
+		send:       make(chan []byte, 256),
+		remoteHost: remoteHost,
+		clientID:   clientID,
 	}
 }
 
 // WritePump pumps messages from the hub to the websocket connection.
 func (c *Client) WritePump() {
+	ticker := time.NewTicker(pingPeriod)
 	defer func() {
+		ticker.Stop()
 		c.conn.Close()
 	}()
-	
-	for message := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-			return
+
+	for {
+		select {
+		case message, ok := <-c.send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				return
+			}
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -129,7 +195,14 @@ func (c *Client) ReadPump() {
 		c.hub.Unregister(c)
 		c.conn.Close()
 	}()
-	
+
+	c.conn.SetReadLimit(maxMessageSize)
+	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
 	for {
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {

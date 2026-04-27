@@ -109,7 +109,6 @@ func (i *Interceptor) InterceptAuto(clientConn net.Conn, targetHost string, targ
 		return i.interceptTLS(peekConn, host, targetPort)
 	}
 
-	fmt.Printf("[DEBUG] Plain connection for %s:%d\n", targetHost, targetPort)
 	return i.interceptPlain(peekConn, targetHost, targetPort)
 }
 
@@ -125,46 +124,16 @@ func (i *Interceptor) Intercept(clientConn net.Conn, targetHost string, targetPo
 // interceptTLS performs TLS MITM on the given connection.
 func (i *Interceptor) interceptTLS(clientConn *PeekableConn, targetHost string, targetPort int) error {
 	serverAddr := fmt.Sprintf("%s:%d", targetHost, targetPort)
-	fmt.Printf("[DEBUG] Connecting to server %s\n", serverAddr)
-	serverTCPConn, err := i.dialer.Dial("tcp", serverAddr)
-	if err != nil {
-		return fmt.Errorf("dial server: %w", err)
-	}
-	defer serverTCPConn.Close()
-
-	// Server TLS config - force HTTP/1.1 only (no H2)
-	serverTLSConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         targetHost,
-		NextProtos:         []string{"http/1.1"}, // Force HTTP/1.1
-	}
-	// Outbound keylog (Proxy -> Remote Server)
-	if i.keyLog != nil {
-		serverTLSConfig.KeyLogWriter = i.keyLog
-	}
-
-	serverConn := tls.Client(serverTCPConn, serverTLSConfig)
-	fmt.Printf("[DEBUG] Server TLS handshake starting for %s\n", targetHost)
-	if err := serverConn.Handshake(); err != nil {
-		return fmt.Errorf("server handshake: %w", err)
-	}
-	fmt.Printf("[DEBUG] Server TLS handshake completed for %s\n", targetHost)
-	defer serverConn.Close()
-
-	negotiatedProto := serverConn.ConnectionState().NegotiatedProtocol
-	fmt.Printf("[DEBUG] Server negotiated ALPN: %q for %s\n", negotiatedProto, targetHost)
 
 	cert, err := i.ca.GetOrCreateCert(targetHost)
 	if err != nil {
 		return fmt.Errorf("get cert: %w", err)
 	}
 
-	// Client TLS config - force HTTP/1.1 only
 	clientTLSConfig := &tls.Config{
 		Certificates: []tls.Certificate{*cert},
-		NextProtos:   []string{"http/1.1"}, // Force HTTP/1.1
+		NextProtos:   []string{"h2", "http/1.1"},
 	}
-	// Inbound keylog (Client -> Proxy)
 	if i.keyLog != nil {
 		clientTLSConfig.KeyLogWriter = i.keyLog
 	}
@@ -178,16 +147,59 @@ func (i *Interceptor) interceptTLS(clientConn *PeekableConn, targetHost string, 
 	fmt.Printf("[DEBUG] Client TLS handshake completed for %s, ALPN: %q\n", targetHost, clientProto)
 	defer tlsClientConn.Close()
 
-	fmt.Printf("[DEBUG] Starting pipe for %s\n", targetHost)
-	err = i.pipe(tlsClientConn, serverConn, targetHost)
+	fmt.Printf("[DEBUG] Connecting to server %s\n", serverAddr)
+	serverTCPConn, err := i.dialer.Dial("tcp", serverAddr)
+	if err != nil {
+		return fmt.Errorf("dial server: %w", err)
+	}
+	defer serverTCPConn.Close()
+
+	serverNextProtos := []string{"http/1.1"}
+	if clientProto == "h2" {
+		serverNextProtos = []string{"h2"}
+	} else if clientProto == "" {
+		serverNextProtos = nil
+	}
+
+	serverTLSConfig := &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         targetHost,
+		NextProtos:         serverNextProtos,
+	}
+	if i.keyLog != nil {
+		serverTLSConfig.KeyLogWriter = i.keyLog
+	}
+
+	serverConn := tls.Client(serverTCPConn, serverTLSConfig)
+	fmt.Printf("[DEBUG] Server TLS handshake starting for %s\n", targetHost)
+	if err := serverConn.Handshake(); err != nil {
+		return fmt.Errorf("server handshake: %w", err)
+	}
+	serverProto := serverConn.ConnectionState().NegotiatedProtocol
+	fmt.Printf("[DEBUG] Server TLS handshake completed for %s, ALPN: %q\n", targetHost, serverProto)
+	defer serverConn.Close()
+
+	if clientProto == "h2" && serverProto != "h2" {
+		return fmt.Errorf("server did not negotiate h2 for h2 client (server ALPN: %q)", serverProto)
+	}
+
+	fmt.Printf("[DEBUG] Starting pipe for %s using %q\n", targetHost, clientProto)
+	err = i.pipeWithProtocol(tlsClientConn, serverConn, targetHost, clientProto)
 	fmt.Printf("[DEBUG] Pipe finished for %s, err=%v\n", targetHost, err)
 	return err
 }
 
 // pipe performs bidirectional data forwarding with optional HTTP parsing.
 func (i *Interceptor) pipe(client, server net.Conn, host string) error {
+	return i.pipeWithProtocol(client, server, host, "")
+}
+
+func (i *Interceptor) pipeWithProtocol(client, server net.Conn, host, protocol string) error {
 	// Use HTTP parsing if enabled
 	if i.enableHTTPParsing {
+		if protocol == "h2" {
+			return i.pipeWithHTTP2Parsing(client, server, host)
+		}
 		return i.pipeWithHTTPParsing(client, server, host)
 	}
 
@@ -241,6 +253,16 @@ func (i *Interceptor) pipeSimple(client, server net.Conn) error {
 
 // pipeWithHTTPParsing performs forwarding with HTTP stream parsing.
 func (i *Interceptor) pipeWithHTTPParsing(client, server net.Conn, host string) error {
+	parser := i.newHTTPParser(host)
+	return parser.Forward(client, server)
+}
+
+func (i *Interceptor) pipeWithHTTP2Parsing(client, server net.Conn, host string) error {
+	parser := i.newHTTPParser(host)
+	return parser.ForwardHTTP2(client, server)
+}
+
+func (i *Interceptor) newHTTPParser(host string) *httpstream.Parser {
 	var logger httpstream.Logger = i.httpLogger
 
 	// If recorder is set, create session logger
@@ -279,8 +301,7 @@ func (i *Interceptor) pipeWithHTTPParsing(client, server net.Conn, host string) 
 		opts = append(opts, httpstream.WithSessionID(session.ID))
 	}
 
-	parser := httpstream.NewParser(host, opts...)
-	return parser.Forward(client, server)
+	return httpstream.NewParser(host, opts...)
 }
 
 // closeWrite closes the write side of a connection if supported.

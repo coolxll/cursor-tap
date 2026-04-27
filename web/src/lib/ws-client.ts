@@ -15,6 +15,7 @@ export class WSClient {
   private maxReconnectDelay = 30000;
   private wasConnected = false;
   private reconnectAttempts = 0;
+  private intentionalClose = false;
 
   constructor(
     url: string, 
@@ -29,9 +30,10 @@ export class WSClient {
   }
 
   connect() {
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) {
       return;
     }
+    this.intentionalClose = false;
 
     try {
       this.ws = new WebSocket(this.url);
@@ -63,7 +65,9 @@ export class WSClient {
       this.ws.onclose = () => {
         console.log('WebSocket disconnected');
         this.onStatus(false);
-        this.scheduleReconnect();
+        if (!this.intentionalClose) {
+          this.scheduleReconnect();
+        }
       };
 
       this.ws.onerror = (error) => {
@@ -93,6 +97,7 @@ export class WSClient {
   }
 
   disconnect() {
+    this.intentionalClose = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

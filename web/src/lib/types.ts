@@ -62,6 +62,73 @@ export interface SessionInfo {
   grpc_preview?: string;
 }
 
+export interface RpcCall {
+  id: string;
+  seq: number;
+  host: string;
+  url?: string;
+  service?: string;
+  method?: string;
+  full_method?: string;
+  status: 'ok' | 'pending' | 'error' | string;
+  http_status?: number;
+  streaming: boolean;
+  started_at: string;
+  ended_at: string;
+  duration_ms: number;
+  record_count: number;
+  frame_count: number;
+  request_bytes: number;
+  response_bytes: number;
+  request_preview?: string;
+  response_preview?: string;
+  error?: string;
+  origin: string;
+}
+
+export interface Capture {
+  id: string;
+  created_at: string;
+  name: string;
+  note?: string;
+  call_count: number;
+  record_count: number;
+  records?: Record[];
+}
+
+export interface ReplayResult {
+  call_id: string;
+  status: number;
+  status_text: string;
+  headers: { [key: string]: string[] };
+  records: Record[];
+}
+
+export interface ProtocolVersion {
+  id: string;
+  created_at: string;
+  path: string;
+  sha256: string;
+  source_kind: string;
+  messages: number;
+  enums: number;
+  services: number;
+  diagnostics: string[];
+  proto_sources: { [key: string]: string };
+  active: boolean;
+}
+
+export interface RuntimeStatus {
+  status: string;
+  http_port: number;
+  socks5_port: number;
+  api_port: number;
+  sqlite_path: string;
+  protocol_path: string;
+  active_protocol: string;
+  ws_clients: number;
+}
+
 export interface RecordFilter {
   session?: string;
   type?: string;

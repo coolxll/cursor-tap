@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "cursor-tap",
+  "outputfilename": "Cursor Tap",
+  "frontend:dir": "web",
+  "frontend:install": "npm ci",
+  "frontend:build": "npm run build",
+  "frontend:dev:install": "npm install",
+  "frontend:dev:watcher": "npm run dev -- --port 3100",
+  "frontend:dev:serverUrl": "http://localhost:3100",
+  "wailsjsdir": "web/wailsjs",
+  "assetdir": "web/out",
+  "info": {
+    "companyName": "cursor-tap",
+    "productName": "Cursor Tap",
+    "productVersion": "0.1.0",
+    "copyright": "2026 cursor-tap"
+  }
+}

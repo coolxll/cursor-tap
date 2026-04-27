@@ -3,7 +3,9 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +22,8 @@ import (
 	"github.com/burpheart/cursor-tap/internal/ca"
 	"github.com/burpheart/cursor-tap/internal/httpstream"
 	"github.com/burpheart/cursor-tap/internal/mitm"
+	"github.com/burpheart/cursor-tap/internal/protoextract"
+	"github.com/burpheart/cursor-tap/internal/storage"
 	"github.com/burpheart/cursor-tap/pkg/types"
 )
 
@@ -30,6 +34,10 @@ type Server struct {
 	interceptor *mitm.Interceptor
 	keyLog      *mitm.KeyLogWriter
 	recorder    *httpstream.Recorder
+	store       *storage.DB
+	recordSink  *storage.AsyncSink
+	protocol    *protoextract.Result
+	registry    *httpstream.MessageRegistry
 
 	httpListener   net.Listener
 	socks5Listener net.Listener
@@ -51,6 +59,16 @@ func NewServer(config types.Config) (*Server, error) {
 	}
 	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+
+	var sqliteStore *storage.DB
+	if config.SQLitePath != "" {
+		var err error
+		sqliteStore, err = storage.Open(config.SQLitePath)
+		if err != nil {
+			return nil, fmt.Errorf("open sqlite: %w", err)
+		}
+		fmt.Printf("[INFO] SQLite enabled: %s\n", sqliteStore.Path())
 	}
 
 	// Initialize CA
@@ -75,6 +93,34 @@ func NewServer(config types.Config) (*Server, error) {
 	// Create interceptor options
 	var interceptorOpts []mitm.InterceptorOption
 	var recorder *httpstream.Recorder
+	var recordSink *storage.AsyncSink
+	var protocol *protoextract.Result
+	registry := httpstream.DefaultGRPCRegistry()
+
+	if config.ProtocolPath != "" {
+		var err error
+		protocol, err = protoextract.Load(config.ProtocolPath)
+		if err != nil {
+			if sqliteStore != nil {
+				sqliteStore.Close()
+			}
+			return nil, fmt.Errorf("load protocol: %w", err)
+		}
+		registry, err = protoextract.BuildRegistry(protocol)
+		if err != nil {
+			if sqliteStore != nil {
+				sqliteStore.Close()
+			}
+			return nil, fmt.Errorf("build protocol registry: %w", err)
+		}
+		interceptorOpts = append(interceptorOpts, mitm.WithGRPCRegistry(registry))
+		if sqliteStore != nil {
+			if err := sqliteStore.SaveProtocol(protocol.StorageVersion(true)); err != nil {
+				fmt.Printf("[WARN] Failed to save protocol version: %v\n", err)
+			}
+		}
+		fmt.Printf("[INFO] Protocol loaded: %s (%d messages, %d services)\n", config.ProtocolPath, protocol.Messages, protocol.Services)
+	}
 
 	// Enable HTTP parsing if configured
 	if config.EnableHTTPParsing {
@@ -90,23 +136,35 @@ func NewServer(config types.Config) (*Server, error) {
 
 		fmt.Printf("[INFO] HTTP parsing enabled (log level: %d)\n", config.HTTPLogLevel)
 
-		// Create recorder if file path is configured
-		if config.HTTPRecordFile != "" {
+		// Create recorder if file path or SQLite path is configured
+		if config.HTTPRecordFile != "" || sqliteStore != nil {
 			var err error
-			recorder, err = httpstream.NewRecorder(
-				config.HTTPRecordFile,
+			recorderOpts := []httpstream.RecorderOption{
 				httpstream.WithRecorderLogLevel(httpLogLevel),
 				httpstream.WithOnRecord(func(rec httpstream.Record) {
 					// Broadcast to WebSocket clients
 					hub.Broadcast(rec)
 				}),
 				httpstream.WithCacheSize(10000),
-			)
+			}
+			if sqliteStore != nil {
+				recordSink = storage.NewAsyncSink(sqliteStore, 50000)
+				recorderOpts = append(recorderOpts, httpstream.WithRecordSink(recordSink))
+			}
+			recorder, err = httpstream.NewRecorder(config.HTTPRecordFile, recorderOpts...)
 			if err != nil {
+				if recordSink != nil {
+					recordSink.Close()
+				}
+				if sqliteStore != nil {
+					sqliteStore.Close()
+				}
 				return nil, fmt.Errorf("create HTTP recorder: %w", err)
 			}
 			interceptorOpts = append(interceptorOpts, mitm.WithRecorder(recorder))
-			fmt.Printf("[INFO] HTTP recording enabled: %s\n", config.HTTPRecordFile)
+			if config.HTTPRecordFile != "" {
+				fmt.Printf("[INFO] HTTP JSONL recording enabled: %s\n", config.HTTPRecordFile)
+			}
 		}
 	}
 
@@ -119,6 +177,10 @@ func NewServer(config types.Config) (*Server, error) {
 		interceptor: interceptor,
 		keyLog:      keyLog,
 		recorder:    recorder,
+		store:       sqliteStore,
+		recordSink:  recordSink,
+		protocol:    protocol,
+		registry:    registry,
 		hub:         hub,
 		stopChan:    make(chan struct{}),
 	}, nil
@@ -211,6 +273,15 @@ func (s *Server) Stop() {
 	}
 	if s.keyLog != nil {
 		s.keyLog.Close()
+	}
+	if s.recorder != nil {
+		s.recorder.Close()
+	}
+	if s.recordSink != nil {
+		s.recordSink.Close()
+	}
+	if s.store != nil {
+		s.store.Close()
 	}
 
 	// Remove API address file
@@ -318,6 +389,15 @@ func (s *Server) handleHTTPRequest(clientConn net.Conn, req *http.Request, _ *bu
 		host = host + ":80"
 	}
 
+	var session *httpstream.Session
+	if s.recorder != nil {
+		session = s.recorder.NewSession(host)
+		if err := s.prepareAndRecordPlainRequest(session, req, host); err != nil {
+			fmt.Printf("[DEBUG] Plain HTTP request record error: %v\n", err)
+			return
+		}
+	}
+
 	// Connect to target
 	targetConn, err := net.DialTimeout("tcp", host, 10*time.Second)
 	if err != nil {
@@ -343,8 +423,84 @@ func (s *Server) handleHTTPRequest(clientConn net.Conn, req *http.Request, _ *bu
 	}
 	defer resp.Body.Close()
 
+	if session != nil {
+		if err := s.recordAndWritePlainResponse(clientConn, session, resp, host); err != nil {
+			fmt.Printf("[DEBUG] Plain HTTP response record error: %v\n", err)
+		}
+		return
+	}
+
 	// Write response back to client
 	resp.Write(clientConn)
+}
+
+func (s *Server) prepareAndRecordPlainRequest(session *httpstream.Session, req *http.Request, host string) error {
+	var body []byte
+	if req.Body != nil {
+		var err error
+		body, err = io.ReadAll(req.Body)
+		if err != nil {
+			return err
+		}
+		_ = req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		if req.ContentLength >= 0 {
+			req.ContentLength = int64(len(body))
+		}
+	}
+
+	session.LogRequest(&httpstream.HTTPMessage{
+		Direction: httpstream.ClientToServer,
+		Request:   req,
+		Host:      host,
+		Timestamp: time.Now(),
+	})
+	logPlainBody(session, httpstream.ClientToServer, host, body, req.Header)
+
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	if req.ContentLength >= 0 {
+		req.ContentLength = int64(len(body))
+	}
+	return nil
+}
+
+func (s *Server) recordAndWritePlainResponse(clientConn net.Conn, session *httpstream.Session, resp *http.Response, host string) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+
+	session.LogResponse(&httpstream.HTTPMessage{
+		Direction: httpstream.ServerToClient,
+		Response:  resp,
+		Host:      host,
+		Timestamp: time.Now(),
+	})
+	logPlainBody(session, httpstream.ServerToClient, host, body, resp.Header)
+
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	resp.TransferEncoding = nil
+	return resp.Write(clientConn)
+}
+
+func logPlainBody(session *httpstream.Session, dir httpstream.Direction, host string, raw []byte, headers http.Header) {
+	if len(raw) == 0 {
+		return
+	}
+	reader := httpstream.NewBodyReader(io.NopCloser(bytes.NewReader(raw)), headers)
+	if reader == nil {
+		return
+	}
+	defer reader.Close()
+	data, err := reader.ReadAll()
+	if err != nil && err != io.EOF {
+		session.Debug("plain HTTP body decode error: %v", err)
+		data = raw
+	}
+	session.LogBody(dir, host, data)
 }
 
 // startSOCKS5Proxy starts the SOCKS5 proxy server.
@@ -480,15 +636,22 @@ func (s *Server) startAPIServer() error {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Write([]byte(`{"status":"running"}`))
+		writeJSON(w, map[string]interface{}{
+			"status":          "running",
+			"http_port":       s.config.HTTPPort,
+			"socks5_port":     s.config.SOCKS5Port,
+			"api_port":        s.config.APIPort,
+			"sqlite_path":     s.config.SQLitePath,
+			"protocol_path":   s.config.ProtocolPath,
+			"active_protocol": activeProtocolID(s.protocol),
+			"ws_clients":      s.hub.ClientCount(),
+		})
 	})
 
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		stats := fmt.Sprintf(`{"active_sessions":0,"total_sessions":0,"total_bytes_sent":0,"total_bytes_received":0,"ws_clients":%d}`, s.hub.ClientCount())
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(stats))
 	})
 
@@ -496,13 +659,54 @@ func (s *Server) startAPIServer() error {
 		http.ServeFile(w, r, s.ca.CertPath())
 	})
 
-	// Register WebSocket and REST API routes if recorder is enabled
-	if s.recorder != nil && s.hub != nil {
-		store := &recorderStore{recorder: s.recorder}
+	// Register WebSocket and REST API routes if recording is enabled
+	if (s.recorder != nil || s.store != nil) && s.hub != nil {
+		store := &recorderStore{recorder: s.recorder, db: s.store}
 		handler := api.NewHandler(s.hub, store)
 		handler.RegisterRoutes(mux)
 		fmt.Printf("[INFO] WebSocket and REST API enabled\n")
 	}
+
+	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			writeCORS(w)
+			return
+		}
+		if s.store == nil {
+			writeJSON(w, []interface{}{})
+			return
+		}
+		limit := parseLimit(r, 500)
+		sessions, err := s.store.ListSessions(limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, sessions)
+	})
+
+	mux.HandleFunc("/api/protocols", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			writeCORS(w)
+			return
+		}
+		if s.store == nil {
+			if s.protocol != nil {
+				writeJSON(w, []interface{}{s.protocol.StorageVersion(true)})
+				return
+			}
+			writeJSON(w, []interface{}{})
+			return
+		}
+		protocols, err := s.store.ListProtocols()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, protocols)
+	})
+
+	s.registerInspectorRoutes(mux)
 
 	addr := fmt.Sprintf("127.0.0.1:%d", s.config.APIPort)
 	s.apiServer = &http.Server{
@@ -517,10 +721,64 @@ func (s *Server) startAPIServer() error {
 // recorderStore adapts httpstream.Recorder to api.RecordStore interface.
 type recorderStore struct {
 	recorder *httpstream.Recorder
+	db       *storage.DB
 }
 
 func (s *recorderStore) GetRecentRecords(limit int) []interface{} {
-	return s.recorder.GetRecentRecords(limit)
+	if s.recorder != nil {
+		return s.recorder.GetRecentRecords(limit)
+	}
+	if s.db != nil {
+		records, err := s.db.RecentRecords(limit)
+		if err == nil {
+			out := make([]interface{}, 0, len(records))
+			for _, rec := range records {
+				out = append(out, rec)
+			}
+			return out
+		}
+	}
+	return []interface{}{}
+}
+
+func (s *recorderStore) ClearRecords() error {
+	if s.recorder != nil {
+		s.recorder.ClearCache()
+	}
+	if s.db != nil {
+		return s.db.ClearTraffic()
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, value interface{}) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(value)
+}
+
+func writeCORS(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.WriteHeader(http.StatusOK)
+}
+
+func parseLimit(r *http.Request, fallback int) int {
+	limit := fallback
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	return limit
+}
+
+func activeProtocolID(protocol *protoextract.Result) string {
+	if protocol == nil {
+		return ""
+	}
+	return protocol.ID
 }
 
 // isConnectionClosed checks if the error indicates a closed connection.

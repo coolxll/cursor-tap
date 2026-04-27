@@ -2,7 +2,9 @@ package httpstream
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"io"
 	"net"
@@ -31,6 +33,9 @@ type Parser struct {
 	lastRequestIsGRPC      bool   // Whether the request was gRPC/Connect
 	lastRequestContentType string // Content-Type of the request
 	lastRequestMutex       sync.Mutex
+
+	http2Streams map[uint32]*http2StreamState
+	http2Mutex   sync.Mutex
 
 	// Callbacks (called asynchronously, don't block main flow)
 	onRequest  func(*HTTPMessage)
@@ -86,9 +91,10 @@ func WithSessionID(id string) ParserOption {
 // NewParser creates a new HTTP stream parser.
 func NewParser(host string, opts ...ParserOption) *Parser {
 	p := &Parser{
-		host:      host,
-		sessionID: generateSessionID(),
-		logger:    NopLogger{},
+		host:         host,
+		sessionID:    generateSessionID(),
+		logger:       NopLogger{},
+		http2Streams: make(map[uint32]*http2StreamState),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -219,9 +225,11 @@ func (p *Parser) parseRequests(reader *bufio.Reader) {
 			p.onRequest(msg)
 		}
 
-		// Check if this is a gRPC request
+		// Check if this is a gRPC/Connect request. JSON Connect is only treated
+		// as RPC when the URL has the canonical /package.Service/Method shape,
+		// so ordinary JSON HTTP APIs still land as plain HTTP bodies.
 		contentType := req.Header.Get("Content-Type")
-		if bodyReader != nil && IsGRPCContentType(contentType) && req.Method == "POST" {
+		if bodyReader != nil && IsRPCRequest(contentType, req.URL.Path) && req.Method == "POST" {
 			// Store URL and content type for response correlation
 			p.lastRequestMutex.Lock()
 			p.lastRequestURL = req.URL.Path
@@ -266,30 +274,28 @@ func (p *Parser) parseResponses(reader *bufio.Reader) {
 			p.onResponse(msg)
 		}
 
-		// Get request correlation info
-		p.lastRequestMutex.Lock()
-		requestPath := p.lastRequestURL
-		requestWasGRPC := p.lastRequestIsGRPC
-		// Clear after use
-		p.lastRequestURL = ""
-		p.lastRequestIsGRPC = false
-		p.lastRequestContentType = ""
-		p.lastRequestMutex.Unlock()
+		requestPath, requestWasGRPC, requestContentType := p.takeLastRequestForResponse()
 
 		// Check if this is a gRPC response
 		contentType := resp.Header.Get("Content-Type")
 
 		// Case 1: Response is explicitly gRPC/Connect
-		if bodyReader != nil && IsGRPCContentType(contentType) && requestPath != "" {
+		if bodyReader != nil && IsRPCRequest(contentType, requestPath) && requestPath != "" {
 			p.parseGRPCBody(bodyReader, requestPath, false, contentType)
 			continue
 		}
 
 		// Case 2: Request was gRPC/Connect but response is SSE (gRPC-over-SSE tunnel)
-		// The SSE is just a transport, actual data is gRPC framing
-		if bodyReader != nil && requestWasGRPC && requestPath != "" {
+		if bodyReader != nil && requestWasGRPC && requestPath != "" && bodyReader.IsSSE() {
 			service, method, _ := ParseMethodFromURL(requestPath)
-			p.parseGRPCStream(bodyReader, service, method, false)
+			p.parseGRPCSSEEvents(bodyReader, service, method)
+			continue
+		}
+
+		// Case 3: Some servers omit Content-Type on RPC responses. Fall back to
+		// the request content type so unary protobuf/JSON responses still decode.
+		if bodyReader != nil && requestWasGRPC && requestPath != "" && contentType == "" && requestContentType != "" {
+			p.parseGRPCBody(bodyReader, requestPath, false, requestContentType)
 			continue
 		}
 
@@ -304,6 +310,25 @@ func (p *Parser) parseResponses(reader *bufio.Reader) {
 			p.logBody(bodyReader, ServerToClient)
 		}
 	}
+}
+
+func (p *Parser) takeLastRequestForResponse() (path string, wasGRPC bool, contentType string) {
+	for attempt := 0; attempt < 100; attempt++ {
+		p.lastRequestMutex.Lock()
+		path = p.lastRequestURL
+		wasGRPC = p.lastRequestIsGRPC
+		contentType = p.lastRequestContentType
+		if path != "" {
+			p.lastRequestURL = ""
+			p.lastRequestIsGRPC = false
+			p.lastRequestContentType = ""
+			p.lastRequestMutex.Unlock()
+			return path, wasGRPC, contentType
+		}
+		p.lastRequestMutex.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	return "", false, ""
 }
 
 // parseSSEEvents parses SSE events from body for logging.
@@ -321,6 +346,57 @@ func (p *Parser) parseSSEEvents(bodyReader *BodyReader) {
 	}
 }
 
+// parseGRPCSSEEvents records SSE transport events and best-effort decodes each
+// event payload as JSON, base64 protobuf, or framed protobuf.
+func (p *Parser) parseGRPCSSEEvents(bodyReader *BodyReader, service, method string) {
+	sseParser := bodyReader.SSE()
+	frameIndex := 0
+	for {
+		event, err := sseParser.Next()
+		if err != nil {
+			break
+		}
+		p.logger.LogSSE(p.host, event)
+		if p.onSSE != nil {
+			p.onSSE(event)
+		}
+
+		data := bytes.TrimSpace([]byte(event.Data))
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+
+		var messages []*GRPCMessage
+		if jsonPayload := normalizeRawJSON(data); jsonPayload != "" {
+			msg := parseConnectJSONBody(data, service, method, false, p.grpcRegistry)
+			msg.IsStreaming = true
+			msg.FrameIndex = frameIndex
+			messages = append(messages, msg)
+		} else if decoded, err := decodeSSEPayload(data); err == nil {
+			if looksLikeGRPCFrame(decoded) {
+				messages = ParseGRPCBody(decoded, service, method, false, p.grpcRegistry, "application/connect+proto")
+			} else {
+				messages = ParseGRPCBody(decoded, service, method, false, p.grpcRegistry, "application/proto")
+			}
+		}
+
+		for _, msg := range messages {
+			if !msg.IsStreaming {
+				msg.IsStreaming = true
+			}
+			if msg.FrameIndex == 0 && frameIndex > 0 {
+				msg.FrameIndex = frameIndex
+			}
+			frameIndex++
+			p.logger.LogGRPC(msg)
+			if p.onGRPC != nil {
+				p.onGRPC(msg)
+			}
+		}
+	}
+	bodyReader.Close()
+}
+
 // parseGRPCBody parses gRPC body frames.
 func (p *Parser) parseGRPCBody(bodyReader *BodyReader, urlPath string, isRequest bool, contentType string) {
 	// Parse service and method from URL
@@ -333,8 +409,27 @@ func (p *Parser) parseGRPCBody(bodyReader *BodyReader, urlPath string, isRequest
 
 	ctInfo := ParseContentType(contentType)
 
-	// For streaming (envelope framing): read frames one by one as they arrive
-	if ctInfo.HasEnvelopeFraming() {
+	if ctInfo.IsConnectJSON || ctInfo.NeedsFullBodyParsing() {
+		data, err := bodyReader.ReadAll()
+		if err != nil && err != io.EOF {
+			p.logger.Debug("gRPC body read error: %v", err)
+			return
+		}
+		messages := ParseGRPCBody(data, service, method, isRequest, p.grpcRegistry, contentType)
+		for _, msg := range messages {
+			p.logger.LogGRPC(msg)
+			if p.onGRPC != nil {
+				p.onGRPC(msg)
+			}
+		}
+		bodyReader.Close()
+		return
+	}
+
+	// For streaming methods, Cursor can still use application/proto, so use
+	// protobuf service metadata in addition to content type.
+	if (p.grpcRegistry != nil && p.grpcRegistry.UsesEnvelopeFraming(service, method, isRequest, contentType)) ||
+		(p.grpcRegistry == nil && ctInfo.HasEnvelopeFraming()) {
 		p.parseGRPCStream(bodyReader, service, method, isRequest)
 		return
 	}
@@ -343,10 +438,6 @@ func (p *Parser) parseGRPCBody(bodyReader *BodyReader, urlPath string, isRequest
 	data, err := bodyReader.ReadAll()
 	if err != nil && err != io.EOF {
 		p.logger.Debug("gRPC body read error: %v", err)
-		return
-	}
-
-	if len(data) == 0 {
 		return
 	}
 
@@ -394,6 +485,31 @@ func (p *Parser) parseGRPCStream(bodyReader *BodyReader, service, method string,
 	}
 
 	bodyReader.Close()
+}
+
+func decodeSSEPayload(data []byte) ([]byte, error) {
+	clean := make([]byte, 0, len(data))
+	for _, b := range data {
+		switch b {
+		case '\r', '\n', '\t', ' ':
+			continue
+		default:
+			clean = append(clean, b)
+		}
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(clean))
+	if err == nil {
+		return decoded, nil
+	}
+	return base64.RawStdEncoding.DecodeString(string(clean))
+}
+
+func looksLikeGRPCFrame(data []byte) bool {
+	if len(data) < 5 {
+		return false
+	}
+	length := int(data[1])<<24 | int(data[2])<<16 | int(data[3])<<8 | int(data[4])
+	return length >= 0 && len(data) >= 5+length
 }
 
 // logBody reads and logs the full body content.
